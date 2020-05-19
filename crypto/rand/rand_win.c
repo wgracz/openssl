@@ -30,7 +30,13 @@
 #  ifndef STATUS_SUCCESS
 #   define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #  endif
-# else
+#  ifndef LOAD_LIBRARY_SEARCH_SYSTEM32 /* in case it was missing in headers. For safer loading system DLLs */
+#   define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#  endif
+# endif
+/* In case Cryptography Next Generation (CNG) was missing or not functional (XP)
+ * let's keep old CryptoApi as a fallback
+ */
 #  include <wincrypt.h>
 /*
  * Intel hardware RNG CSP -- available from
@@ -38,21 +44,20 @@
  */
 #  define PROV_INTEL_SEC 22
 #  define INTEL_DEF_PROV L"Intel Hardware Cryptographic Service Provider"
-# endif
 
 size_t rand_pool_acquire_entropy(RAND_POOL *pool)
 {
-# ifndef USE_BCRYPTGENRANDOM
-    HCRYPTPROV hProvider;
-#else   
+# ifdef USE_BCRYPTGENRANDOM
 /*
  *  On modern system use CNG API, but on older ones fallback to CryptoAPI
  */
     typedef NTSTATUS (WINAPI *PFN_BCryptGenRandom)(BCRYPT_ALG_HANDLE,PUCHAR,ULONG,ULONG);
-    static PFN_BCryptGenRandom s_pfnBCryptGenRandom = (PFN_BCryptGenRandom)-1; /* unset yet */
+    #define PFN_BCryptGenRandom_NOTSET ((PFN_BCryptGenRandom)-1)
+    static PFN_BCryptGenRandom s_pfnBCryptGenRandom = PFN_BCryptGenRandom_NOTSET; /* unset yet */
     PFN_BCryptGenRandom pfnBCryptGenRandom;
 # endif
-     
+    HCRYPTPROV hProvider;
+
     unsigned char *buffer;
     size_t bytes_needed;
     size_t entropy_available = 0;
@@ -71,24 +76,24 @@ size_t rand_pool_acquire_entropy(RAND_POOL *pool)
 # endif
 
 # ifdef USE_BCRYPTGENRANDOM
-    pfnBCryptGenRandom=(PFN_BCryptGenRandom)InterlockedCompareExchangePointer((volatile LPVOID *)&s_pfnBCryptGenRandom,0,0);     
-    if(pfnBCryptGenRandom == (PFN_BCryptGenRandom)-1) {
+    pfnBCryptGenRandom=(PFN_BCryptGenRandom)InterlockedCompareExchangePointer((volatile LPVOID *)&s_pfnBCryptGenRandom,0,0);
+    if(pfnBCryptGenRandom == PFN_BCryptGenRandom_NOTSET) {
         HMODULE hmBCrypt;
-        PFN_BCryptGenRandom pfnBCryptGenRandom2; 
-         
+        PFN_BCryptGenRandom pfnBCryptGenRandom2;
+
         hmBCrypt=LoadLibraryExA("BCRYPT.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
         if(hmBCrypt!=NULL)
              pfnBCryptGenRandom=(PFN_BCryptGenRandom)GetProcAddress(hmBCrypt,"BCryptGenRandom");
         else
              pfnBCryptGenRandom=NULL;
-         
-        pfnBCryptGenRandom2 = (PFN_BCryptGenRandom)InterlockedCompareExchangePointer((volatile LPVOID *)&s_pfnBCryptGenRandom,pfnBCryptGenRandom,(void *)-1);
-        if(pfnBCryptGenRandom2!=(PFN_BCryptGenRandom)-1) {
-             if(hmBCrypt!=NULL) FreeLibrary(hmBCrypt); /* some other thread has was faster */
+
+        pfnBCryptGenRandom2 = (PFN_BCryptGenRandom)InterlockedCompareExchangePointer((volatile LPVOID *)&s_pfnBCryptGenRandom,pfnBCryptGenRandom,PFN_BCryptGenRandom_NOTSET);
+        if(pfnBCryptGenRandom2!=PFN_BCryptGenRandom_NOTSET) {
+             if(hmBCrypt!=NULL) FreeLibrary(hmBCrypt); /* some other thread was faster */
              pfnBCryptGenRandom = pfnBCryptGenRandom2;
         }
     }
-    if(pfnBCryptGenRandom != NULL) {     
+    if(pfnBCryptGenRandom != NULL) {
         bytes_needed = rand_pool_bytes_needed(pool, 1 /*entropy_factor*/);
         buffer = rand_pool_add_begin(pool, bytes_needed);
         if (buffer != NULL) {
